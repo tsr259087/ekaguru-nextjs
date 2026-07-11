@@ -121,6 +121,7 @@ function EkaGuruApp() {
   });
   const [mForm, setMForm] = useState({ name: "", phone: "", profession: "", expertise: [], languages: [], maxMentees: 2 });
   const [schoolsCatalog, setSchoolsCatalog] = useState([]);
+  const [studentPrivateById, setStudentPrivateById] = useState({});
 
   // Firestore's onSnapshot pushes live updates automatically — there's no manual
   // "loadData" step anymore, and no separate persist step either. Each collection
@@ -163,6 +164,16 @@ function EkaGuruApp() {
     const unsubSchools = subscribeToCollection("schools", (docs) => setSchoolsCatalog(docs), (error) =>
       console.error("[EkaGuru] Failed to load schools catalog:", error)
     );
+    // student_private is restricted by firestore.rules to the student themself or an
+    // admin. A non-admin signed-in user will get a permission-denied error trying to
+    // list ALL documents in this collection (Firestore denies an unfiltered query
+    // unless the rule can prove every possible result is allowed) — that's expected,
+    // not a bug. Only an account with the admin custom claim will see real data here.
+    const unsubStudentPrivate = subscribeToCollection(
+      "student_private",
+      (docs) => setStudentPrivateById(Object.fromEntries(docs.map((d) => [d.id, d]))),
+      (error) => console.warn("[EkaGuru] student_private unavailable (expected unless signed in as admin):", error.code)
+    );
 
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
@@ -173,6 +184,7 @@ function EkaGuruApp() {
       unsubStudents();
       unsubMentors();
       unsubSchools();
+      unsubStudentPrivate();
       clearTimeout(timeoutId);
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
@@ -763,10 +775,13 @@ function EkaGuruApp() {
               <Lock size={14} className="mt-0.5 shrink-0 text-[#1B2A4A]" />
               <span>
                 This tab shows parent, school, and teacher/principal contact details that are never
-                displayed to mentors. In the deployed Firebase backend, this data lives in a separate
-                <code className="mx-1 bg-white px-1 rounded">student_private</code> collection that only a
-                signed-in user with the <code className="mx-1 bg-white px-1 rounded">admin</code> custom claim
-                can read — this demo view has no real access control, since it's a client-only prototype.
+                displayed to mentors. This data lives in a separate
+                <code className="mx-1 bg-white px-1 rounded">student_private</code> Firestore collection,
+                enforced by <code className="mx-1 bg-white px-1 rounded">firestore.rules</code> — only the
+                student themself or a signed-in user with the
+                <code className="mx-1 bg-white px-1 rounded">admin</code> custom claim can read it.
+                If the fields below are blank, you're not currently signed in as an admin — the tab
+                itself isn't gated on that yet (a follow-up item), but the underlying data access is.
               </span>
             </div>
 
@@ -775,27 +790,36 @@ function EkaGuruApp() {
               <p className="text-sm text-[#8A806C]">No students registered yet.</p>
             ) : (
               <div className="space-y-3">
-                {students.map(s => (
-                  <div key={s.id} className="bg-white border border-[#E4DCC9] rounded-xl p-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="font-semibold text-[#1B2A4A]">{s.name}</div>
-                      <span className="text-xs text-[#8A806C]">{s.edu} · {s.careerInterest}</span>
-                    </div>
-                    <div className="grid md:grid-cols-2 gap-4 text-xs text-[#4A4235]">
-                      <div>
-                        <div className="font-semibold text-[#8A806C] uppercase tracking-wide mb-1">Parent / guardian</div>
-                        <div>{s.private?.parentName} ({s.private?.parentRelation})</div>
-                        <div className="flex items-center gap-1"><Phone size={11} />{s.private?.parentPhone}</div>
+                {students.map(s => {
+                  const priv = studentPrivateById[s.id];
+                  return (
+                    <div key={s.id} className="bg-white border border-[#E4DCC9] rounded-xl p-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="font-semibold text-[#1B2A4A]">{s.name}</div>
+                        <span className="text-xs text-[#8A806C]">{s.edu} · {s.careerInterest}</span>
                       </div>
-                      <div>
-                        <div className="font-semibold text-[#8A806C] uppercase tracking-wide mb-1">School</div>
-                        <div>{s.private?.schoolName}, {s.private?.schoolVillage}</div>
-                        <div>{s.private?.schoolContactName} ({s.private?.schoolContactRole})</div>
-                        <div className="flex items-center gap-1"><Phone size={11} />{s.private?.schoolContactPhone}</div>
-                      </div>
+                      {priv ? (
+                        <div className="grid md:grid-cols-2 gap-4 text-xs text-[#4A4235]">
+                          <div>
+                            <div className="font-semibold text-[#8A806C] uppercase tracking-wide mb-1">Parent / guardian</div>
+                            <div>{priv.parentName} ({priv.parentRelation})</div>
+                            <div className="flex items-center gap-1"><Phone size={11} />{priv.parentPhone}</div>
+                          </div>
+                          <div>
+                            <div className="font-semibold text-[#8A806C] uppercase tracking-wide mb-1">School</div>
+                            <div>{priv.schoolName}, {priv.schoolVillage}</div>
+                            <div>{priv.schoolContactName} ({priv.schoolContactRole})</div>
+                            <div className="flex items-center gap-1"><Phone size={11} />{priv.schoolContactPhone}</div>
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="text-xs text-[#8A806C] italic">
+                          Parent and school details not visible — sign in as an admin to view.
+                        </p>
+                      )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
