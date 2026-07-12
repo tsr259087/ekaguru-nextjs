@@ -1,10 +1,11 @@
 "use client";
 
 import React, { useState, useEffect, useMemo } from "react";
-import { Sprout, Users, GraduationCap, ArrowRight, Check, X, Phone, MapPin, Languages, BadgeCheck, Loader2, Lock } from "lucide-react";
-import { saveStudentProfile, saveStudentPrivateInfo, saveMentorProfile, subscribeToCollection } from "@/lib/data";
+import { Sprout, Users, GraduationCap, ArrowRight, Check, X, Phone, MapPin, Languages, BadgeCheck, Loader2, Lock, Heart, MessageCircle, BookOpen, ExternalLink } from "lucide-react";
+import { saveStudentProfile, saveStudentPrivateInfo, saveMentorProfile, saveMentorPrivateInfo, subscribeToCollection, completeMentorship, logAuditEvent } from "@/lib/data";
 import { auth } from "@/lib/firebase";
 import { signOut } from "firebase/auth";
+import { CAREER_AREAS } from "@/lib/constants";
 
 const STATES = ["Telangana", "Andhra Pradesh"];
 
@@ -28,18 +29,25 @@ const DISTRICTS_BY_STATE = {
   ]
 };
 
-const CAREER_AREAS = [
-  "Engineering", "Medicine", "Government Exams (Groups)", "Teaching",
-  "IT / Software", "Agriculture Sciences", "Banking", "Nursing",
-  "Civil Services (UPSC)", "Skilled Trades / ITI"
-];
-
 const LANGUAGES = ["Telugu", "English", "Hindi", "Urdu"];
 
 const EDU_LEVELS = ["Below Class 10", "Class 10", "Intermediate (11/12)", "Undergraduate", "Graduate"];
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
+}
+
+// Builds a WhatsApp "click to chat" link (wa.me) with a pre-filled message — this
+// works with just a phone number, no Business API or approved template needed,
+// since it's the person themself opening a normal WhatsApp conversation, not EkaGuru
+// sending an automated message on their behalf.
+function whatsappChatLink(phone, message) {
+  if (!phone) return null;
+  const digits = phone.replace(/\D/g, "");
+  // Assumes a 10-digit Indian mobile number if no country code was entered at
+  // registration; prepends 91. Adjust here if EkaGuru expands beyond India.
+  const fullNumber = digits.length === 10 ? `91${digits}` : digits;
+  return `https://wa.me/${fullNumber}?text=${encodeURIComponent(message)}`;
 }
 
 function computeMatches(students, mentors) {
@@ -106,7 +114,7 @@ function SproutBar({ load, max }) {
 }
 
 function EkaGuruApp() {
-  const [tab, setTab] = useState("student");
+  const [tab, setTab] = useState("mymatch");
   const [students, setStudents] = useState([]);
   const [mentors, setMentors] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -116,12 +124,18 @@ function EkaGuruApp() {
 
   const [sForm, setSForm] = useState({
     name: "", phone: "", state: "", district: "", edu: "", careerInterest: "", language: "",
+    dateOfBirth: "", gender: "",
     parentName: "", parentPhone: "", parentRelation: "", consentGiven: false,
     schoolName: "", schoolVillage: "", schoolContactName: "", schoolContactPhone: "", schoolContactRole: ""
   });
-  const [mForm, setMForm] = useState({ name: "", phone: "", profession: "", expertise: [], languages: [], maxMentees: 2 });
+  const [mForm, setMForm] = useState({ name: "", phone: "", profession: "", linkedinUrl: "", expertise: [], languages: [], maxMentees: 2 });
   const [schoolsCatalog, setSchoolsCatalog] = useState([]);
+  const [resources, setResources] = useState([]);
+  const [resourceFilter, setResourceFilter] = useState("");
+  const [confirmingCompleteId, setConfirmingCompleteId] = useState(null); // studentId mid-confirmation, or null
+  const [completingId, setCompletingId] = useState(null); // studentId currently being submitted
   const [studentPrivateById, setStudentPrivateById] = useState({});
+  const [mentorPrivateById, setMentorPrivateById] = useState({});
 
   // Firestore's onSnapshot pushes live updates automatically — there's no manual
   // "loadData" step anymore, and no separate persist step either. Each collection
@@ -164,6 +178,9 @@ function EkaGuruApp() {
     const unsubSchools = subscribeToCollection("schools", (docs) => setSchoolsCatalog(docs), (error) =>
       console.error("[EkaGuru] Failed to load schools catalog:", error)
     );
+    const unsubResources = subscribeToCollection("resources", (docs) => setResources(docs), (error) =>
+      console.error("[EkaGuru] Failed to load resources:", error)
+    );
     // student_private is restricted by firestore.rules to the student themself or an
     // admin. A non-admin signed-in user will get a permission-denied error trying to
     // list ALL documents in this collection (Firestore denies an unfiltered query
@@ -173,6 +190,11 @@ function EkaGuruApp() {
       "student_private",
       (docs) => setStudentPrivateById(Object.fromEntries(docs.map((d) => [d.id, d]))),
       (error) => console.warn("[EkaGuru] student_private unavailable (expected unless signed in as admin):", error.code)
+    );
+    const unsubMentorPrivate = subscribeToCollection(
+      "mentor_private",
+      (docs) => setMentorPrivateById(Object.fromEntries(docs.map((d) => [d.id, d]))),
+      (error) => console.warn("[EkaGuru] mentor_private unavailable (expected unless signed in as admin):", error.code)
     );
 
     const handleOnline = () => setIsOnline(true);
@@ -184,7 +206,9 @@ function EkaGuruApp() {
       unsubStudents();
       unsubMentors();
       unsubSchools();
+      unsubResources();
       unsubStudentPrivate();
+      unsubMentorPrivate();
       clearTimeout(timeoutId);
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
@@ -196,7 +220,26 @@ function EkaGuruApp() {
   // since a fresh subscription will immediately re-fetch current state.
   const loadData = () => window.location.reload();
 
-  const { matched, loadById } = useMemo(() => computeMatches(students, mentors), [students, mentors]);
+  const activeStudentsForMatching = useMemo(
+    () => students.filter(s => s.mentorshipStatus !== "completed"),
+    [students]
+  );
+  const { matched, loadById } = useMemo(() => computeMatches(activeStudentsForMatching, mentors), [activeStudentsForMatching, mentors]);
+
+  // Derived "my match" data — reuses the already-computed matched map rather than a
+  // separate Firestore query, since students/mentors are already subscribed above.
+  const myUid = auth?.currentUser?.uid;
+  const myStudentRecord = useMemo(() => students.find(s => s.id === myUid), [students, myUid]);
+  const myMentorRecord = useMemo(() => mentors.find(m => m.id === myUid), [mentors, myUid]);
+  const myMatchedMentor = useMemo(() => {
+    if (!myStudentRecord) return null;
+    const mentorId = matched[myStudentRecord.id];
+    return mentorId ? mentors.find(m => m.id === mentorId) : null;
+  }, [myStudentRecord, matched, mentors]);
+  const myMatchedStudents = useMemo(() => {
+    if (!myMentorRecord) return [];
+    return students.filter(s => matched[s.id] === myMentorRecord.id);
+  }, [myMentorRecord, matched, students]);
 
   const interestAvailability = useMemo(() => {
     const availability = {};
@@ -264,14 +307,17 @@ function EkaGuruApp() {
     const uid = auth.currentUser.uid;
 
     // Public profile — readable by any signed-in user (a matched mentor needs this).
+    // Deliberately excludes date of birth and gender — a mentor needs career interest,
+    // language, and education level, not a student's exact age or gender.
     const publicProfile = {
       name: sForm.name, phone: sForm.phone, state: sForm.state, district: sForm.district,
       edu: sForm.edu, careerInterest: sForm.careerInterest, language: sForm.language,
       consentGiven: sForm.consentGiven,
     };
-    // Private data — parent + school/teacher contact. Only this student or an admin
-    // can read this document; see firestore.rules for the actual enforcement.
+    // Private data — parent + school/teacher contact, date of birth, gender. Only
+    // this student or an admin can read this document; see firestore.rules.
     const privateInfo = {
+      dateOfBirth: sForm.dateOfBirth, gender: sForm.gender,
       parentName: sForm.parentName, parentPhone: sForm.parentPhone, parentRelation: sForm.parentRelation,
       consentGivenAt: Date.now(),
       schoolName: sForm.schoolName, schoolVillage: sForm.schoolVillage,
@@ -288,8 +334,13 @@ function EkaGuruApp() {
       return;
     }
 
+    // Fire-and-forget: audit logging must never block or fail registration itself.
+    logAuditEvent("student_registered", { careerInterest: sForm.careerInterest, district: sForm.district })
+      .catch((e) => console.error("[EkaGuru] audit log failed (non-blocking):", e));
+
     setSForm({
       name: "", phone: "", state: "", district: "", edu: "", careerInterest: "", language: "",
+      dateOfBirth: "", gender: "",
       parentName: "", parentPhone: "", parentRelation: "", consentGiven: false,
       schoolName: "", schoolVillage: "", schoolContactName: "", schoolContactPhone: "", schoolContactRole: ""
     });
@@ -314,6 +365,19 @@ function EkaGuruApp() {
   };
 
 
+  const handleCompleteMentorship = async (studentId) => {
+    setCompletingId(studentId);
+    try {
+      await completeMentorship(studentId);
+      showToast("Mentorship marked as complete. Capacity is now freed up for a new match.", "good");
+    } catch (e) {
+      console.error("[EkaGuru] completeMentorship failed:", e);
+      showToast("Couldn't complete this mentorship — check your connection and try again.", "bad");
+    }
+    setCompletingId(null);
+    setConfirmingCompleteId(null);
+  };
+
   const submitMentor = async () => {
     if (!isOnline) {
       showToast("You're offline — please reconnect before registering.", "bad");
@@ -327,6 +391,10 @@ function EkaGuruApp() {
       showToast("Please fill every field and pick at least one area and language.", "bad");
       return;
     }
+    if (!mForm.linkedinUrl || !mForm.linkedinUrl.toLowerCase().includes("linkedin.com")) {
+      showToast("Please share a valid LinkedIn profile URL — this helps admins verify volunteers.", "bad");
+      return;
+    }
 
     try {
       // saveMentorProfile always writes approved: false — firestore.rules blocks a
@@ -334,14 +402,19 @@ function EkaGuruApp() {
       // setMentorApproval Cloud Function (see the Firebase backend README).
       // This differs from the earlier client-only demo, which auto-approved
       // client-side for the sake of a self-contained walkthrough.
-      await saveMentorProfile(auth.currentUser.uid, mForm);
+      const { linkedinUrl, ...publicMentorFields } = mForm;
+      await saveMentorProfile(auth.currentUser.uid, publicMentorFields);
+      await saveMentorPrivateInfo(auth.currentUser.uid, { linkedinUrl });
     } catch (e) {
       console.error("Registration error", e);
       showToast("Couldn't save your registration — check your connection and try again. Nothing was lost.", "bad");
       return;
     }
 
-    setMForm({ name: "", phone: "", profession: "", expertise: [], languages: [], maxMentees: 2 });
+    logAuditEvent("mentor_registered", { expertise: mForm.expertise })
+      .catch((e) => console.error("[EkaGuru] audit log failed (non-blocking):", e));
+
+    setMForm({ name: "", phone: "", profession: "", linkedinUrl: "", expertise: [], languages: [], maxMentees: 2 });
     showToast("Thank you for volunteering — your application is under review.", "good");
   };
 
@@ -459,6 +532,8 @@ function EkaGuruApp() {
       {/* Tabs */}
       <nav className="max-w-5xl mx-auto px-6 pt-6 flex gap-2">
         {[
+          { id: "mymatch", label: "My Match", icon: Heart },
+          { id: "resources", label: "Resources", icon: BookOpen },
           { id: "student", label: "Join as a student", icon: GraduationCap },
           { id: "mentor", label: "Volunteer as a mentor", icon: Users },
           { id: "dashboard", label: "Dashboard", icon: BadgeCheck },
@@ -477,6 +552,209 @@ function EkaGuruApp() {
       </nav>
 
       <main className="max-w-5xl mx-auto px-6 pb-16 pt-6">
+        {tab === "mymatch" && (
+          <div className="max-w-xl">
+            {myStudentRecord?.mentorshipStatus === "completed" ? (
+              <div className="bg-white rounded-2xl border border-[#E4DCC9] p-6 md:p-8 text-center">
+                <Check size={28} className="text-[#0F6B5C] mx-auto mb-3" />
+                <h2 className="display text-xl font-bold text-[#1B2A4A] mb-2">Mentorship completed</h2>
+                <p className="text-sm text-[#8A806C]">
+                  This chapter is done — thank you for being part of EkaGuru. If you'd like guidance
+                  in a new area, reach out to an admin about registering again.
+                </p>
+              </div>
+            ) : myStudentRecord ? (
+              myMatchedMentor ? (
+                <div className="bg-white rounded-2xl border border-[#E4DCC9] p-6 md:p-8">
+                  <div className="text-xs font-semibold text-[#0F6B5C] uppercase tracking-wide mb-1">Your mentor</div>
+                  <h2 className="display text-2xl font-bold text-[#1B2A4A] mb-1">{myMatchedMentor.name}</h2>
+                  <p className="text-sm text-[#8A806C] mb-4">{myMatchedMentor.profession}</p>
+                  <div className="flex flex-wrap gap-2 mb-5">
+                    {myMatchedMentor.expertise.map(a => (
+                      <span key={a} className="text-xs bg-[#0F6B5C]/10 text-[#0F6B5C] px-2.5 py-1 rounded-full">{a}</span>
+                    ))}
+                  </div>
+                  <a
+                    href={whatsappChatLink(
+                      myMatchedMentor.phone,
+                      `Hi ${myMatchedMentor.name}, I'm ${myStudentRecord.name} from EkaGuru! I'm interested in ${myStudentRecord.careerInterest} and would love your guidance.`
+                    )}
+                    target="_blank" rel="noopener noreferrer"
+                    className="w-full bg-[#0F6B5C] hover:bg-[#0C5A4D] text-white font-semibold rounded-lg py-3 flex items-center justify-center gap-2 transition-colors"
+                  >
+                    <MessageCircle size={16} /> Message on WhatsApp
+                  </a>
+                  <p className="text-xs text-[#8A806C] mt-3 text-center mb-4">
+                    Opens WhatsApp with a friendly intro message already written — you can edit it before sending.
+                  </p>
+
+                  {resources.filter(r => r.careerInterest === myStudentRecord.careerInterest).length > 0 && (
+                    <div className="border-t border-[#E4DCC9] pt-4 mb-4">
+                      <div className="text-xs font-semibold text-[#8A806C] uppercase tracking-wide mb-2">
+                        Recommended resources for {myStudentRecord.careerInterest}
+                      </div>
+                      <div className="space-y-2">
+                        {resources.filter(r => r.careerInterest === myStudentRecord.careerInterest).slice(0, 3).map(r => (
+                          <a key={r.id} href={r.url} target="_blank" rel="noopener noreferrer"
+                            className="flex items-center gap-1.5 text-sm text-[#0F6B5C] hover:text-[#0C5A4D] font-medium">
+                            <BookOpen size={14} /> {r.title}
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="border-t border-[#E4DCC9] pt-4">
+                    {confirmingCompleteId === myStudentRecord.id ? (
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleCompleteMentorship(myStudentRecord.id)}
+                          disabled={completingId === myStudentRecord.id}
+                          className="flex-1 text-sm font-semibold text-white bg-[#C1502E] hover:bg-[#A8431F] disabled:opacity-60 rounded-lg py-2"
+                        >
+                          {completingId === myStudentRecord.id ? "Completing..." : "Yes, mark as complete"}
+                        </button>
+                        <button
+                          onClick={() => setConfirmingCompleteId(null)}
+                          className="flex-1 text-sm font-medium text-[#8A806C] hover:text-[#1B2A4A] rounded-lg py-2"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmingCompleteId(myStudentRecord.id)}
+                        className="text-xs text-[#8A806C] hover:text-[#1B2A4A] underline underline-offset-2"
+                      >
+                        Mark this mentorship as complete
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-white rounded-2xl border border-dashed border-[#D8CFBE] p-6 md:p-8 text-center">
+                  <h2 className="display text-xl font-bold text-[#1B2A4A] mb-2">You're on the waitlist</h2>
+                  <p className="text-sm text-[#8A806C]">
+                    No mentor is available in <strong>{myStudentRecord.careerInterest}</strong> yet.
+                    We'll notify you on WhatsApp the moment one joins — no need to do anything else.
+                  </p>
+                </div>
+              )
+            ) : myMentorRecord ? (
+              !myMentorRecord.approved ? (
+                <div className="bg-white rounded-2xl border border-dashed border-[#D8CFBE] p-6 md:p-8 text-center">
+                  <h2 className="display text-xl font-bold text-[#1B2A4A] mb-2">Application under review</h2>
+                  <p className="text-sm text-[#8A806C]">
+                    Thank you for volunteering — an EkaGuru admin will review your application soon.
+                  </p>
+                </div>
+              ) : myMatchedStudents.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-dashed border-[#D8CFBE] p-6 md:p-8 text-center">
+                  <h2 className="display text-xl font-bold text-[#1B2A4A] mb-2">No students matched yet</h2>
+                  <p className="text-sm text-[#8A806C]">
+                    You're approved and visible to students — we'll notify you as soon as someone is matched to you.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between mb-1">
+                    <h2 className="display text-xl font-bold text-[#1B2A4A]">Your students</h2>
+                    <SproutBar load={loadById[myMentorRecord.id] || 0} max={myMentorRecord.maxMentees} />
+                  </div>
+                  {myMatchedStudents.map(s => (
+                    <div key={s.id} className="bg-white rounded-2xl border border-[#E4DCC9] p-5">
+                      <div className="font-semibold text-[#1B2A4A]">{s.name}</div>
+                      <div className="text-xs text-[#8A806C] mb-3">{s.district}, {s.state} · {s.careerInterest} · {s.edu}</div>
+                      <a
+                        href={whatsappChatLink(
+                          s.phone,
+                          `Hi ${s.name}, I'm ${myMentorRecord.name} from EkaGuru — happy to help with ${s.careerInterest}. When's a good time to talk?`
+                        )}
+                        target="_blank" rel="noopener noreferrer"
+                        className="inline-flex items-center gap-2 text-sm font-semibold text-[#0F6B5C] hover:text-[#0C5A4D] mb-3"
+                      >
+                        <MessageCircle size={14} /> Message on WhatsApp
+                      </a>
+                      <div className="border-t border-[#E4DCC9] pt-3">
+                        {confirmingCompleteId === s.id ? (
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => handleCompleteMentorship(s.id)}
+                              disabled={completingId === s.id}
+                              className="text-xs font-semibold text-white bg-[#C1502E] hover:bg-[#A8431F] disabled:opacity-60 rounded-lg px-3 py-1.5"
+                            >
+                              {completingId === s.id ? "Completing..." : "Yes, mark complete"}
+                            </button>
+                            <button
+                              onClick={() => setConfirmingCompleteId(null)}
+                              className="text-xs font-medium text-[#8A806C] hover:text-[#1B2A4A] px-3 py-1.5"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setConfirmingCompleteId(s.id)}
+                            className="text-xs text-[#8A806C] hover:text-[#1B2A4A] underline underline-offset-2"
+                          >
+                            Mark this mentorship as complete
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )
+            ) : (
+              <div className="bg-white rounded-2xl border border-dashed border-[#D8CFBE] p-6 md:p-8 text-center">
+                <h2 className="display text-xl font-bold text-[#1B2A4A] mb-2">You haven't registered yet</h2>
+                <p className="text-sm text-[#8A806C]">
+                  Use the <strong>Join as a student</strong> or <strong>Volunteer as a mentor</strong> tab above to get started.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "resources" && (
+          <div>
+            <h2 className="display text-2xl font-bold text-[#1B2A4A] mb-1">Free learning resources</h2>
+            <p className="text-sm text-[#8A806C] mb-5">
+              Curated links to free or low-cost courses and official exam resources — not a substitute
+              for your mentor, but useful for self-study between sessions.
+            </p>
+
+            <select value={resourceFilter} onChange={e => setResourceFilter(e.target.value)}
+              className="border border-[#D8CFBE] rounded-lg px-3 py-2 text-sm mb-5 focus:outline-none focus:ring-2 focus:ring-[#0F6B5C]">
+              <option value="">All career interests</option>
+              {CAREER_AREAS.map(a => <option key={a} value={a}>{a}</option>)}
+            </select>
+
+            {resources.length === 0 ? (
+              <p className="text-sm text-[#8A806C]">No resources loaded yet.</p>
+            ) : (
+              <div className="grid md:grid-cols-2 gap-3">
+                {resources
+                  .filter(r => !resourceFilter || r.careerInterest === resourceFilter)
+                  .map(r => (
+                    <a key={r.id} href={r.url} target="_blank" rel="noopener noreferrer"
+                      className="bg-white border border-[#E4DCC9] rounded-xl p-4 hover:border-[#0F6B5C] transition-colors">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-xs font-semibold text-[#0F6B5C] uppercase tracking-wide">{r.careerInterest}</span>
+                        {r.isFree && <span className="text-xs bg-[#0F6B5C]/10 text-[#0F6B5C] px-2 py-0.5 rounded-full">Free</span>}
+                      </div>
+                      <div className="font-semibold text-[#1B2A4A] flex items-center gap-1.5">
+                        {r.title} <ExternalLink size={12} className="text-[#8A806C]" />
+                      </div>
+                      <div className="text-xs text-[#8A806C] mt-1">{r.provider}</div>
+                      {r.description && <p className="text-xs text-[#4A4235] mt-2">{r.description}</p>}
+                    </a>
+                  ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {tab === "student" && (
           <div className="bg-white rounded-2xl border border-[#E4DCC9] p-6 md:p-8 max-w-xl">
             <h2 className="display text-2xl font-bold text-[#1B2A4A] mb-1">Tell us about yourself</h2>
@@ -532,6 +810,25 @@ function EkaGuruApp() {
                 <option value="">Preferred language</option>
                 {LANGUAGES.map(d => <option key={d} value={d}>{d}</option>)}
               </select>
+
+              <div>
+                <label className="text-xs text-[#8A806C] mb-1 block">Date of birth (optional)</label>
+                <input type="date" value={sForm.dateOfBirth} max={new Date().toISOString().split("T")[0]}
+                  onChange={e => setSForm({ ...sForm, dateOfBirth: e.target.value })}
+                  className="w-full border border-[#D8CFBE] rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#0F6B5C]" />
+              </div>
+
+              <select value={sForm.gender} onChange={e => setSForm({ ...sForm, gender: e.target.value })}
+                className="w-full border border-[#D8CFBE] rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#0F6B5C]">
+                <option value="">Gender (optional)</option>
+                <option value="Female">Female</option>
+                <option value="Male">Male</option>
+                <option value="Other">Other</option>
+                <option value="Prefer not to say">Prefer not to say</option>
+              </select>
+              <p className="text-xs text-[#8A806C] -mt-2">
+                Kept private — used only for EkaGuru's internal records, never shown to your mentor.
+              </p>
 
               <div className="pt-2 border-t border-[#E4DCC9]">
                 <div className="text-sm font-semibold text-[#1B2A4A] mt-4 mb-1">Parent or guardian details</div>
@@ -646,6 +943,13 @@ function EkaGuruApp() {
                 className="w-full border border-[#D8CFBE] rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#0F6B5C]" />
               <input placeholder="Profession (e.g. Software Engineer at TCS)" value={mForm.profession} onChange={e => setMForm({ ...mForm, profession: e.target.value })}
                 className="w-full border border-[#D8CFBE] rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#0F6B5C]" />
+              <div>
+                <input placeholder="LinkedIn profile URL" value={mForm.linkedinUrl} onChange={e => setMForm({ ...mForm, linkedinUrl: e.target.value })}
+                  className="w-full border border-[#D8CFBE] rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#0F6B5C]" />
+                <p className="text-xs text-[#8A806C] mt-1">
+                  Helps our admin team verify volunteers before approval — only shown to admins, never to students.
+                </p>
+              </div>
 
               <div>
                 <div className="text-sm font-medium text-[#4A4235] mb-2">Areas you can mentor in</div>
@@ -799,7 +1103,12 @@ function EkaGuruApp() {
                         <span className="text-xs text-[#8A806C]">{s.edu} · {s.careerInterest}</span>
                       </div>
                       {priv ? (
-                        <div className="grid md:grid-cols-2 gap-4 text-xs text-[#4A4235]">
+                        <div className="grid md:grid-cols-3 gap-4 text-xs text-[#4A4235]">
+                          <div>
+                            <div className="font-semibold text-[#8A806C] uppercase tracking-wide mb-1">Personal</div>
+                            <div>DOB: {priv.dateOfBirth || "—"}</div>
+                            <div>Gender: {priv.gender || "—"}</div>
+                          </div>
                           <div>
                             <div className="font-semibold text-[#8A806C] uppercase tracking-wide mb-1">Parent / guardian</div>
                             <div>{priv.parentName} ({priv.parentRelation})</div>
@@ -815,6 +1124,38 @@ function EkaGuruApp() {
                       ) : (
                         <p className="text-xs text-[#8A806C] italic">
                           Parent and school details not visible — sign in as an admin to view.
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <h2 className="display text-2xl font-bold text-[#1B2A4A] mb-4 mt-10">Mentor records</h2>
+            {mentors.length === 0 ? (
+              <p className="text-sm text-[#8A806C]">No mentors registered yet.</p>
+            ) : (
+              <div className="space-y-3">
+                {mentors.map(m => {
+                  const priv = mentorPrivateById[m.id];
+                  return (
+                    <div key={m.id} className="bg-white border border-[#E4DCC9] rounded-xl p-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="font-semibold text-[#1B2A4A]">{m.name}</div>
+                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${m.approved ? "bg-[#0F6B5C]/10 text-[#0F6B5C]" : "bg-[#C1502E]/10 text-[#C1502E]"}`}>
+                          {m.approved ? "Approved" : "Pending review"}
+                        </span>
+                      </div>
+                      <div className="text-xs text-[#8A806C] mb-2">{m.profession}</div>
+                      {priv?.linkedinUrl ? (
+                        <a href={priv.linkedinUrl} target="_blank" rel="noopener noreferrer"
+                          className="text-xs text-[#0F6B5C] hover:text-[#0C5A4D] font-medium underline underline-offset-2">
+                          View LinkedIn profile ↗
+                        </a>
+                      ) : (
+                        <p className="text-xs text-[#8A806C] italic">
+                          LinkedIn not visible — sign in as an admin to view.
                         </p>
                       )}
                     </div>
