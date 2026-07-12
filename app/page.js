@@ -1,15 +1,10 @@
-import AuthGate from "@/components/AuthGate";
+import LandingPage from "@/components/LandingPage";
 
-// This page depends entirely on live client-side Firebase (auth, Firestore) — there's
-// nothing meaningful to pre-render at build time, and attempting to do so runs
-// EkaGuruApp's Firebase initialization in Vercel's Node build environment, where
-// real env vars/browser context aren't available the same way. Forcing dynamic
-// rendering skips build-time prerendering and renders this page per-request instead.
+// The landing page reads public Firestore stats (student/mentor/match counts,
+// per-subject coverage) — nothing sensitive, but still live data, so this stays
+// dynamic rather than statically prerendered at build time.
 export const dynamic = "force-dynamic";
 
-// This page itself is a server component (the Next.js App Router default).
-// AuthGate (a client component) decides whether to show Login or EkaGuruApp
-// based on whether Firebase reports a signed-in user.
 export default function Home() {
-  return <AuthGate />;
+  return <LandingPage />;
 }
